@@ -1,22 +1,24 @@
-#  Pyrogram - Telegram MTProto API Client Library for Python
+#  Pyrofork - Telegram MTProto API Client Library for Python
 #  Copyright (C) 2017-present Dan <https://github.com/delivrance>
+#  Copyright (C) 2022-present Mayuri-Chan <https://github.com/Mayuri-Chan>
 #
-#  This file is part of Pyrogram.
+#  This file is part of Pyrofork.
 #
-#  Pyrogram is free software: you can redistribute it and/or modify
+#  Pyrofork is free software: you can redistribute it and/or modify
 #  it under the terms of the GNU Lesser General Public License as published
 #  by the Free Software Foundation, either version 3 of the License, or
 #  (at your option) any later version.
 #
-#  Pyrogram is distributed in the hope that it will be useful,
+#  Pyrofork is distributed in the hope that it will be useful,
 #  but WITHOUT ANY WARRANTY; without even the implied warranty of
 #  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 #  GNU Lesser General Public License for more details.
 #
 #  You should have received a copy of the GNU Lesser General Public License
-#  along with Pyrogram.  If not, see <http://www.gnu.org/licenses/>.
+#  along with Pyrofork.  If not, see <http://www.gnu.org/licenses/>.
 
 import html
+import logging
 import re
 from typing import Optional
 
@@ -32,8 +34,10 @@ STRIKE_DELIM = "~~"
 SPOILER_DELIM = "||"
 CODE_DELIM = "`"
 PRE_DELIM = "```"
+BLOCKQUOTE_DELIM = ">"
+BLOCKQUOTE_EXPANDABLE_DELIM = "**>"
 
-MARKDOWN_RE = re.compile(r"({d})|\[(.+?)\]\((.+?)\)".format(
+MARKDOWN_RE = re.compile(r"({d})|(!?)\[(.+?)\]\((.+?)\)".format(
     d="|".join(
         ["".join(i) for i in [
             [rf"\{j}" for j in i]
@@ -52,23 +56,69 @@ MARKDOWN_RE = re.compile(r"({d})|\[(.+?)\]\((.+?)\)".format(
 OPENING_TAG = "<{}>"
 CLOSING_TAG = "</{}>"
 URL_MARKUP = '<a href="{}">{}</a>'
+EMOJI_MARKUP = '<emoji id={}>{}</emoji>'
 FIXED_WIDTH_DELIMS = [CODE_DELIM, PRE_DELIM]
+CODE_TAG_RE = re.compile(r"<code>.*?</code>")
 
 
 class Markdown:
     def __init__(self, client: Optional["pyrogram.Client"]):
         self.html = HTML(client)
 
+    def blockquote_parser(self, text):
+        text = re.sub(r'\n&gt;', '\n>', re.sub(r'^&gt;', '>', text))
+        lines = text.split('\n')
+        result = []
+
+        in_blockquote = False
+
+        for line in lines:
+            if line.startswith(BLOCKQUOTE_DELIM):
+                if not in_blockquote:
+                    line = re.sub(r'^> ', OPENING_TAG.format("blockquote"), line)
+                    line = re.sub(r'^>', OPENING_TAG.format("blockquote"), line)
+                    in_blockquote = True
+                    result.append(line.strip())
+                else:
+                    result.append(line[1:].strip())
+            elif line.startswith(BLOCKQUOTE_EXPANDABLE_DELIM):
+                if not in_blockquote:
+                    line = re.sub(r'^\*\*> ', OPENING_TAG.format("blockquote expandable"), line)
+                    line = re.sub(r'^\*\*>', OPENING_TAG.format("blockquote expandable"), line)
+                    in_blockquote = True
+                    result.append(line.strip())
+                else:
+                    result.append(line[3:].strip())
+            else:
+                if in_blockquote:
+                    line = CLOSING_TAG.format("blockquote") + line
+                    in_blockquote = False
+                result.append(line)
+
+        if in_blockquote:
+            line = result[len(result)-1] + CLOSING_TAG.format("blockquote")
+            result.pop(len(result)-1)
+            result.append(line)
+
+        return '\n'.join(result)
+
     async def parse(self, text: str, strict: bool = False):
         if strict:
             text = html.escape(text)
+        text = self.blockquote_parser(text)
 
         delims = set()
         is_fixed_width = False
 
+        placeholders = {}
+        for i, code_section in enumerate(CODE_TAG_RE.findall(text)):
+            placeholder = f"{{CODE_SECTION_{i}}}"
+            placeholders[placeholder] = code_section
+            text = text.replace(code_section, placeholder, 1)
+
         for i, match in enumerate(re.finditer(MARKDOWN_RE, text)):
             start, _ = match.span()
-            delim, text_url, url = match.groups()
+            delim, is_emoji, text_url, url = match.groups()
             full = match.group(0)
 
             if delim in FIXED_WIDTH_DELIMS:
@@ -77,8 +127,14 @@ class Markdown:
             if is_fixed_width and delim not in FIXED_WIDTH_DELIMS:
                 continue
 
-            if text_url:
+            if not is_emoji and text_url:
                 text = utils.replace_once(text, full, URL_MARKUP.format(url, text_url), start)
+                continue
+
+            if is_emoji:
+                emoji = text_url
+                emoji_id = url.lstrip("tg://emoji?id=")
+                text = utils.replace_once(text, full, EMOJI_MARKUP.format(emoji_id, emoji), start)
                 continue
 
             if delim == BOLD_DELIM:
@@ -113,6 +169,9 @@ class Markdown:
 
             text = utils.replace_once(text, delim, tag, start)
 
+        for placeholder, code_section in placeholders.items():
+            text = text.replace(placeholder, code_section)
+
         return await self.html.parse(text)
 
     @staticmethod
@@ -141,7 +200,24 @@ class Markdown:
                 start_tag = f"{PRE_DELIM}{language}\n"
                 end_tag = f"\n{PRE_DELIM}"
             elif entity_type == MessageEntityType.BLOCKQUOTE:
-                start_tag = end_tag = PRE_DELIM
+                if entity.collapsed:
+                    start_tag = BLOCKQUOTE_EXPANDABLE_DELIM + " "
+                else:
+                    start_tag = BLOCKQUOTE_DELIM + " "
+                end_tag = ""
+                blockquote_text = text[start:end]
+                lines = blockquote_text.split("\n")
+                last_length = 0
+                for line in lines:
+                    if len(line) == 0 and last_length == end:
+                        continue
+                    start_offset = start+last_length
+                    last_length = last_length+len(line)
+                    end_offset = start_offset+last_length
+                    entities_offsets.append((start_tag, start_offset,))
+                    entities_offsets.append((end_tag, end_offset,))
+                    last_length = last_length+1
+                continue
             elif entity_type == MessageEntityType.SPOILER:
                 start_tag = end_tag = SPOILER_DELIM
             elif entity_type == MessageEntityType.TEXT_LINK:
@@ -152,6 +228,10 @@ class Markdown:
                 user = entity.user
                 start_tag = "["
                 end_tag = f"](tg://user?id={user.id})"
+            elif entity_type == MessageEntityType.CUSTOM_EMOJI:
+                emoji_id = entity.custom_emoji_id
+                start_tag = "!["
+                end_tag = f"](tg://emoji?id={emoji_id})"
             else:
                 continue
 
