@@ -22,13 +22,14 @@ import logging
 import os
 from hashlib import sha1
 from io import BytesIO
+from typing import Optional
 
 import pyrogram
 from pyrogram import raw
 from pyrogram.connection import Connection
 from pyrogram.crypto import mtproto
 from pyrogram.errors import (
-    RPCError, InternalServerError, AuthKeyDuplicated, FloodWait, ServiceUnavailable, BadMsgNotification,
+    RPCError, InternalServerError, AuthKeyDuplicated, FloodWait, FloodPremiumWait, ServiceUnavailable, BadMsgNotification,
     SecurityCheckMismatch
 )
 from pyrogram.raw.all import layer
@@ -75,7 +76,7 @@ class Session:
         self.is_media = is_media
         self.is_cdn = is_cdn
 
-        self.connection = None
+        self.connection: Optional[Connection] = None
 
         self.auth_key_id = sha1(auth_key).digest()[-8:]
 
@@ -101,12 +102,13 @@ class Session:
 
     async def start(self):
         while True:
-            self.connection = Connection(
-                self.dc_id,
-                self.test_mode,
-                self.client.ipv6,
-                self.client.proxy,
-                self.is_media
+            self.connection = self.client.connection_factory(
+                dc_id=self.dc_id,
+                test_mode=self.test_mode,
+                ipv6=self.client.ipv6,
+                proxy=self.client.proxy,
+                media=self.is_media,
+                protocol_factory=self.client.protocol_factory
             )
 
             try:
@@ -125,10 +127,11 @@ class Session:
                                 app_version=self.client.app_version,
                                 device_model=self.client.device_model,
                                 system_version=self.client.system_version,
-                                system_lang_code=self.client.lang_code,
+                                system_lang_code=self.client.system_lang_code,
+                                lang_pack=self.client.lang_pack,
                                 lang_code=self.client.lang_code,
-                                lang_pack="",
                                 query=raw.functions.help.GetConfig(),
+                                params=self.client.init_connection_params,
                             )
                         ),
                         timeout=self.START_TIMEOUT
@@ -285,7 +288,10 @@ class Session:
                         ping_id=0, disconnect_delay=self.WAIT_TIMEOUT + 10
                     ), False
                 )
-            except (OSError, RPCError):
+            except OSError:
+                self.loop.create_task(self.restart())
+                break
+            except RPCError:
                 pass
 
         log.info("PingTask stopped")
@@ -299,6 +305,12 @@ class Session:
             if packet is None or len(packet) == 4:
                 if packet:
                     error_code = -Int.read(BytesIO(packet))
+
+                    if error_code == 404:
+                        raise Exception(
+                            "Auth key not found in the system. You must delete your session file"
+                            "and log in again with your phone number or bot token"
+                        )
 
                     log.warning(
                         "Server sent transport error: %s (%s)",
@@ -387,7 +399,7 @@ class Session:
         while True:
             try:
                 return await self.send(query, timeout=timeout)
-            except FloodWait as e:
+            except (FloodWait, FloodPremiumWait) as e:
                 amount = e.value
 
                 if amount > sleep_threshold >= 0:
